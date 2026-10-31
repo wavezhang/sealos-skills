@@ -41,8 +41,11 @@ not `latest`.
 
 Registry choice, in order:
 
-1. **GHCR** when `gh` CLI is authenticated:
+1. **GHCR** when the user has already authenticated the `gh` CLI. Ask the
+   user to run the login themselves; do not read `gh auth token` into the
+   agent context:
    ```bash
+   # user-run, not an agent tool call
    gh auth token | docker login ghcr.io -u "$(gh api user -q .login)" --password-stdin
    docker buildx build --platform linux/amd64 -t ghcr.io/<user>/<app>:<tag> --push .
    ```
@@ -55,15 +58,17 @@ Registry choice, in order:
 
 GHCR images are private by default. Either make the package public
 (`gh api --method PATCH /user/packages/container/<app> -f visibility=public`
-— confirm with the user first), or create a pull secret in the Sealos
-namespace and reference it from the workload:
+— the user runs this, and confirms first), or create a pull secret in the
+Sealos namespace and reference it from the workload. Set `GHCR_USER` and
+`GHCR_TOKEN` in the user's shell first; the values are used from the
+environment and never printed:
 
 ```bash
 export KUBECONFIG=~/.sealos/kubeconfig
 kubectl create secret docker-registry <app>-pull \
   --docker-server=ghcr.io \
-  --docker-username="$(gh api user -q .login)" \
-  --docker-password="$(gh auth token)" \
+  --docker-username="${GHCR_USER:?set GHCR_USER}" \
+  --docker-password="${GHCR_TOKEN:?set GHCR_TOKEN to a write:packages token}" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
