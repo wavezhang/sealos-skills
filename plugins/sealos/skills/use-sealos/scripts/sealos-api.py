@@ -50,6 +50,25 @@ SEALOS_DIR = os.path.expanduser("~/.sealos")
 AUTH_PATH = os.path.join(SEALOS_DIR, "auth.json")
 DEFAULT_KUBECONFIG_PATH = os.path.join(SEALOS_DIR, "kubeconfig")
 
+# Only official Sealos domains are trusted by default. Extra domains must be
+# listed explicitly by the user, e.g.
+#   SEALOS_ALLOWED_DOMAINS=self-hosted.example.com,sealos.internal
+ALLOWED_DOMAINS_ENV = "SEALOS_ALLOWED_DOMAINS"
+OFFICIAL_REGION_SUFFIXES = ("sealos.io", "sealos.run")
+
+# A short-lived, least-privilege token is the intended credential for the
+# Template/Brain API. Until the server issues one, the kubeconfig fallback is
+# kept for compatibility and loudly flagged as a residual risk.
+SCOPED_TOKEN_ENV = "SEALOS_API_SCOPED_TOKEN"
+
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(authorization|access[_-]?token|regional[_-]?token|refresh[_-]?token|"
+    r"device[_-]?code|client[_-]?key[_-]?data|client[_-]?certificate[_-]?data|"
+    r"kubeconfig|password|secret([_-]?key)?|token)"
+)
+_SECRET_VALUES = set()
+_KUBECONFIG_AUTH_WARNED = False
+
 
 def resolve_kubeconfig_path():
     """Explicit SEALOS_KUBECONFIG wins; then the login-owned default; then an
@@ -70,13 +89,153 @@ KUBECONFIG_PATH = resolve_kubeconfig_path()
 KUBECONFIG_WRITE_PATH = os.environ.get("SEALOS_KUBECONFIG") or DEFAULT_KUBECONFIG_PATH
 
 
+def _remember_secret(value):
+    if isinstance(value, str) and len(value) >= 8:
+        _SECRET_VALUES.add(value)
+
+
+def _redact_text(text):
+    if not isinstance(text, str):
+        return text
+    for secret in sorted(_SECRET_VALUES, key=len, reverse=True):
+        if secret in text:
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(
+        r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----",
+        "[REDACTED PEM BLOCK]",
+        text,
+        flags=re.DOTALL,
+    )
+    return re.sub(
+        r"(?i)([\"']?(?:authorization|access[_-]?token|regional[_-]?token|"
+        r"device[_-]?code|kubeconfig|password|client[_-]?key[_-]?data|"
+        r"secret(?:[_-]?key)?|token)[\"']?\s*[:=]\s*)[\"']?[^\s\"',}]+",
+        r"\1[REDACTED]",
+        text,
+    )
+
+
+def redact_obj(value):
+    """Recursively redact credentials before printing errors or responses."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[REDACTED]"
+                if isinstance(key, str) and _SENSITIVE_KEY_RE.search(key)
+                else redact_obj(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_obj(item) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def emit(value, **kwargs):
+    print(json.dumps(redact_obj(value), **kwargs))
+
+
+def allowed_domain_bases():
+    """Official Sealos domains plus user-configured domains, lowercased."""
+    bases = list(OFFICIAL_REGION_SUFFIXES)
+    for raw in os.environ.get(ALLOWED_DOMAINS_ENV, "").split(","):
+        value = raw.strip().lower()
+        if not value:
+            continue
+        if "://" in value:
+            value = urllib.parse.urlparse(value).hostname or ""
+        value = value.lstrip("*.").strip(".")
+        if value and re.fullmatch(r"[a-z0-9.-]+", value) and ".." not in value:
+            bases.append(value)
+    return tuple(dict.fromkeys(bases))
+
+
+def host_is_allowed(host):
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    return any(
+        host == base or host.endswith("." + base) for base in allowed_domain_bases()
+    )
+
+
+def validate_region_url(value, source="region"):
+    """Return a normalized https://host[:port] URL or abort."""
+    raw = (value or "").strip()
+    if not raw:
+        fail(f"{source} is empty")
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme != "https":
+        fail(f"{source} must use https", scheme=parsed.scheme)
+    if parsed.username or parsed.password:
+        fail(f"{source} must not embed credentials")
+    if not parsed.hostname:
+        fail(f"{source} has no host")
+    try:
+        port = parsed.port
+    except ValueError:
+        fail(f"{source} has an invalid port")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        fail(f"{source} must be a bare https://host[:port] URL")
+    if not host_is_allowed(parsed.hostname):
+        fail(
+            f"{source} host is not an allowed Sealos domain",
+            host=parsed.hostname,
+            allowed=list(allowed_domain_bases()),
+        )
+    return "https://" + parsed.hostname + (f":{port}" if port else "")
+
+
+def require_https_sealos_url(url):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        fail("refusing non-https request URL", scheme=parsed.scheme)
+    if not parsed.hostname or not host_is_allowed(parsed.hostname):
+        fail(
+            "refusing request to a host outside the allowed Sealos domains",
+            host=parsed.hostname,
+            allowed=list(allowed_domain_bases()),
+        )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: a 30x would replay credentials elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _warn_legacy_kubeconfig_auth():
+    global _KUBECONFIG_AUTH_WARNED
+    if _KUBECONFIG_AUTH_WARNED:
+        return
+    _KUBECONFIG_AUTH_WARNED = True
+    print(
+        "warning: the full kubeconfig is being sent as an API credential. This "
+        "is a known residual risk until the server issues scoped tokens; set "
+        f"{SCOPED_TOKEN_ENV} to a server-issued scoped token to stop sending it.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def fail(message, **extra):
-    print(json.dumps({"error": message, **extra}), file=sys.stderr)
+    payload = {"error": _redact_text(str(message))}
+    payload.update(redact_obj(extra))
+    print(json.dumps(payload), file=sys.stderr)
     sys.exit(1)
 
 
 def http_json(url, method="GET", headers=None, data=None, form=None, timeout=30, fatal=True):
-    """Make an HTTP request; return (status, parsed-json-or-text)."""
+    """Make an HTTPS request to an allowed Sealos host; refuse redirects."""
+    require_https_sealos_url(url)
     body = None
     headers = dict(headers or {})
     if form is not None:
@@ -87,10 +246,16 @@ def http_json(url, method="GET", headers=None, data=None, form=None, timeout=30,
         headers.setdefault("Content-Type", "application/json")
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             text = resp.read().decode()
             status = resp.status
     except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            fail(
+                "refusing to follow an HTTP redirect; credentials are never forwarded",
+                status=e.code,
+                host=urllib.parse.urlparse(url).hostname,
+            )
         text = e.read().decode(errors="replace")
         status = e.code
     except (urllib.error.URLError, TimeoutError) as e:
@@ -108,9 +273,12 @@ def load_auth():
         return {}
     try:
         with open(AUTH_PATH) as f:
-            return json.load(f)
+            auth = json.load(f)
     except ValueError:
         return {}
+    _remember_secret(auth.get("access_token"))
+    _remember_secret(auth.get("regional_token"))
+    return auth
 
 
 def load_kubeconfig():
@@ -120,7 +288,27 @@ def load_kubeconfig():
             path=KUBECONFIG_PATH,
         )
     with open(KUBECONFIG_PATH) as f:
-        return f.read()
+        kubeconfig = f.read()
+    _remember_secret(kubeconfig)
+    return kubeconfig
+
+
+def authorization_value(bearer=False):
+    """Credential for the Template/Brain API.
+
+    Prefer SEALOS_API_SCOPED_TOKEN. The kubeconfig fallback is kept only until
+    the server accepts scoped tokens and is warned about on stderr.
+    """
+    token = os.environ.get(SCOPED_TOKEN_ENV, "").strip()
+    if token:
+        _remember_secret(token)
+        return f"Bearer {token}" if bearer else token
+    _warn_legacy_kubeconfig_auth()
+    kubeconfig = load_kubeconfig()
+    quoted = urllib.parse.quote(kubeconfig, safe="")
+    _remember_secret(kubeconfig)
+    _remember_secret(quoted)
+    return f"Bearer {quoted}" if bearer else quoted
 
 
 def kubeconfig_field(kubeconfig, field):
@@ -129,17 +317,24 @@ def kubeconfig_field(kubeconfig, field):
 
 
 def region_domain():
-    """Region domain (e.g. usw-1.sealos.io), from auth.json or the kubeconfig server."""
+    """Validated region domain (e.g. usw-1.sealos.io), from auth.json or kubeconfig."""
     auth = load_auth()
     if auth.get("region"):
-        return urllib.parse.urlparse(auth["region"]).netloc
+        return urllib.parse.urlparse(
+            validate_region_url(auth["region"], "auth.json region")
+        ).hostname
     server = kubeconfig_field(load_kubeconfig(), "server")
     if not server:
         fail("cannot determine region: no auth.json region and no server in kubeconfig")
-    return urllib.parse.urlparse(server).hostname
+    return urllib.parse.urlparse(
+        validate_region_url(server, "kubeconfig server")
+    ).hostname
 
 
 def save_credentials(region, access_token, regional_token, kubeconfig, workspace):
+    _remember_secret(access_token)
+    _remember_secret(regional_token)
+    _remember_secret(kubeconfig)
     os.makedirs(SEALOS_DIR, exist_ok=True)
     with open(KUBECONFIG_WRITE_PATH, "w") as f:
         f.write(kubeconfig)
@@ -178,11 +373,14 @@ def cmd_status(_args):
                 "workspace": (auth.get("current_workspace") or {}).get("id"),
                 "authenticated_at": auth.get("authenticated_at"),
             }
-    print(json.dumps(out, indent=2))
+    print(json.dumps(redact_obj(out), indent=2))
 
 
 def cmd_login(args):
-    region = (args.region or os.environ.get("SEALOS_REGION") or DEFAULT_REGION).rstrip("/")
+    region = validate_region_url(
+        args.region or os.environ.get("SEALOS_REGION") or DEFAULT_REGION,
+        "--region",
+    )
 
     status, device = http_json(
         f"{region}/api/auth/oauth2/device",
@@ -269,16 +467,14 @@ def cmd_login(args):
             }
 
     save_credentials(region, token, data["token"], data["kubeconfig"], workspace)
-    print(
-        json.dumps(
-            {
-                "authenticated": True,
-                "region": region,
-                "workspace": (workspace or {}).get("id"),
-                "kubeconfig": KUBECONFIG_WRITE_PATH,
-            },
-            indent=2,
-        )
+    emit(
+        {
+            "authenticated": True,
+            "region": region,
+            "workspace": (workspace or {}).get("id"),
+            "kubeconfig": KUBECONFIG_WRITE_PATH,
+        },
+        indent=2,
     )
 
 
@@ -286,6 +482,7 @@ def regional_token_or_fail():
     auth = load_auth()
     if not auth.get("regional_token"):
         fail("no regional token; run `sealos-api.py login` first")
+    auth["region"] = validate_region_url(auth.get("region"), "auth.json region")
     return auth
 
 
@@ -301,23 +498,21 @@ def cmd_workspaces(_args):
     if isinstance(namespaces, dict):
         namespaces = namespaces.get("namespaces") or []
     current = (auth.get("current_workspace") or {}).get("id")
-    print(
-        json.dumps(
-            {
-                "current": current,
-                "workspaces": [
-                    {
-                        "uid": ns.get("uid"),
-                        "id": ns.get("id"),
-                        "teamName": ns.get("teamName"),
-                        "role": ns.get("role"),
-                        "nstype": ns.get("nstype"),
-                    }
-                    for ns in namespaces
-                ],
-            },
-            indent=2,
-        )
+    emit(
+        {
+            "current": current,
+            "workspaces": [
+                {
+                    "uid": ns.get("uid"),
+                    "id": ns.get("id"),
+                    "teamName": ns.get("teamName"),
+                    "role": ns.get("role"),
+                    "nstype": ns.get("nstype"),
+                }
+                for ns in namespaces
+            ],
+        },
+        indent=2,
     )
 
 
@@ -371,7 +566,7 @@ def cmd_switch(args):
         "teamName": match.get("teamName"),
     }
     save_credentials(auth["region"], auth.get("access_token"), new_token, kubeconfig, workspace)
-    print(json.dumps({"switched": True, "workspace": workspace}, indent=2))
+    emit({"switched": True, "workspace": workspace}, indent=2)
 
 
 # 0 = transport failure from http_json(..., fatal=False)
@@ -505,9 +700,8 @@ def maybe_adopt_template_instance(instance_name, template_name=None, dry_run=Fal
             "missing-instance-name",
             error="could not determine instance name from the Template API response",
         )
-    kubeconfig = load_kubeconfig()
     url = f"https://brain.{domain}/api/projects/adopt-template-instance"
-    headers = {"Authorization": f"Bearer {urllib.parse.quote(kubeconfig, safe='')}"}
+    headers = {"Authorization": authorization_value(bearer=True)}
     body = {"instanceName": instance_name}
     if template_name:
         body["templateName"] = template_name
@@ -531,7 +725,6 @@ def cmd_deploy(args):
 
     deploy_args = parse_deploy_args(args)
     extra_labels = parse_extra_labels(args)
-    kubeconfig = load_kubeconfig()
     domain = region_domain()
     url = f"https://template.{domain}/api/v2alpha/templates/raw"
     body = {"yaml": yaml_text, "args": deploy_args, "dryRun": bool(args.dry_run)}
@@ -540,7 +733,7 @@ def cmd_deploy(args):
     status, resp = http_json(
         url,
         method="POST",
-        headers={"Authorization": urllib.parse.quote(kubeconfig, safe="")},
+        headers={"Authorization": authorization_value()},
         data=body,
         timeout=120,
     )
@@ -558,7 +751,7 @@ def cmd_deploy(args):
             template_name=template_name_from_yaml(yaml_text),
             dry_run=bool(args.dry_run),
         )
-    print(json.dumps(result, indent=2))
+    emit(result, indent=2)
     if not ok:
         sys.exit(1)
 
@@ -605,13 +798,12 @@ def cmd_deploy_store(args):
     name = args.name or (
         args.template + "-" + "".join(random.choices(string.ascii_lowercase, k=8))
     )
-    kubeconfig = load_kubeconfig()
     domain = region_domain()
     url = f"https://template.{domain}/api/v2alpha/templates/instances"
     status, resp = http_json(
         url,
         method="POST",
-        headers={"Authorization": urllib.parse.quote(kubeconfig, safe="")},
+        headers={"Authorization": authorization_value()},
         data={"name": name, "template": args.template, "args": parse_deploy_args(args)},
         timeout=120,
     )
@@ -622,14 +814,14 @@ def cmd_deploy_store(args):
             extract_instance_name(resp, fallback=name),
             template_name=args.template,
         )
-    print(json.dumps(result, indent=2))
+    emit(result, indent=2)
     if not ok:
         sys.exit(1)
 
 
 def cmd_adopt(args):
     result = maybe_adopt_template_instance(args.instance, template_name=args.template_name)
-    print(json.dumps({"instance": args.instance, "brain_adoption": result}, indent=2))
+    emit({"instance": args.instance, "brain_adoption": result}, indent=2)
     if result.get("skipped"):
         if result.get("error"):
             sys.exit(1)
@@ -651,7 +843,7 @@ def cmd_store_get(args):
         status, src = http_json(
             f"https://template.{domain}/api/getTemplateSource"
             f"?templateName={urllib.parse.quote(args.template)}&includeReadme=false",
-            headers={"Authorization": urllib.parse.quote(load_kubeconfig(), safe="")},
+            headers={"Authorization": authorization_value()},
             timeout=30,
         )
         if status == 200 and isinstance(src, dict):
@@ -660,7 +852,7 @@ def cmd_store_get(args):
             out["appYaml"] = data.get("appYaml")
         else:
             out["yaml_error"] = f"getTemplateSource failed ({status})"
-    print(json.dumps(out, indent=2))
+    emit(out, indent=2)
 
 
 def cmd_store_export(args):
@@ -670,7 +862,7 @@ def cmd_store_export(args):
     status, src = http_json(
         f"https://template.{domain}/api/getTemplateSource"
         f"?templateName={urllib.parse.quote(args.template)}&includeReadme=false",
-        headers={"Authorization": urllib.parse.quote(load_kubeconfig(), safe="")},
+        headers={"Authorization": authorization_value()},
         timeout=30,
     )
     if status != 200 or not isinstance(src, dict):
@@ -686,17 +878,15 @@ def cmd_store_export(args):
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         f.write(combined)
-    print(
-        json.dumps(
-            {
-                "success": True,
-                "template": args.template,
-                "out": args.out,
-                "bytes": len(combined.encode()),
-                "sha256": hashlib.sha256(combined.encode()).hexdigest(),
-            },
-            indent=2,
-        )
+    emit(
+        {
+            "success": True,
+            "template": args.template,
+            "out": args.out,
+            "bytes": len(combined.encode()),
+            "sha256": hashlib.sha256(combined.encode()).hexdigest(),
+        },
+        indent=2,
     )
 
 
@@ -704,7 +894,7 @@ def cmd_instances(_args):
     domain = region_domain()
     status, resp = http_json(
         f"https://template.{domain}/api/instance/list",
-        headers={"Authorization": urllib.parse.quote(load_kubeconfig(), safe="")},
+        headers={"Authorization": authorization_value()},
         timeout=30,
     )
     if status != 200:
@@ -724,23 +914,25 @@ def cmd_instances(_args):
                     "created": meta.get("creationTimestamp"),
                 }
             )
-        print(json.dumps({"count": len(out), "instances": out}, indent=2))
+        emit({"count": len(out), "instances": out}, indent=2)
     else:
-        print(json.dumps(resp, indent=2))
+        emit(resp, indent=2)
 
 
 def cmd_delete(args):
-    kubeconfig = load_kubeconfig()
     domain = region_domain()
     url = f"https://template.{domain}/api/v2alpha/templates/instances/{urllib.parse.quote(args.instance)}"
     status, resp = http_json(
         url,
         method="DELETE",
-        headers={"Authorization": urllib.parse.quote(kubeconfig, safe="")},
+        headers={"Authorization": authorization_value()},
         timeout=120,
     )
     ok = status in (200, 204)
-    print(json.dumps({"success": ok, "status": status, "instance": args.instance, "response": resp or None}, indent=2))
+    emit(
+        {"success": ok, "status": status, "instance": args.instance, "response": resp or None},
+        indent=2,
+    )
     if not ok:
         sys.exit(1)
 
@@ -767,17 +959,28 @@ def cmd_store_list(args):
         haystack = json.dumps(entry).lower()
         if not query or query in haystack:
             items.append(entry)
-    print(json.dumps({"count": len(items), "templates": items}, indent=2))
+    emit({"count": len(items), "templates": items}, indent=2)
 
 
 def main():
+    if os.environ.get(ALLOWED_DOMAINS_ENV):
+        print(
+            "allowed Sealos domains: " + ", ".join(allowed_domain_bases()),
+            file=sys.stderr,
+        )
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status")
 
     p = sub.add_parser("login")
-    p.add_argument("--region", help=f"region URL (default {DEFAULT_REGION}); known: {', '.join(KNOWN_REGIONS)}")
+    p.add_argument(
+        "--region",
+        help=(
+            f"region URL (default {DEFAULT_REGION}); known: {', '.join(KNOWN_REGIONS)}; "
+            f"extra hosts must be listed in {ALLOWED_DOMAINS_ENV}"
+        ),
+    )
 
     sub.add_parser("workspaces")
 
