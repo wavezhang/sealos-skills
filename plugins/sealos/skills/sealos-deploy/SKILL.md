@@ -84,10 +84,15 @@ No Docker daemon exists here. Build with the sibling executor:
 
 ```bash
 python3 ../k8s-kaniko-job/scripts/kaniko-build.py \
-  --image "ghcr.io/<token-login>/<repo>:deploy-<git-short-sha>"
+  --image "ghcr.io/<token-login>/<repo>:deploy-<git-short-sha>" \
+  --trust-repo-config
 ```
 
 (paths relative to this skill; run it from `$SEALAI_DEPLOY_WORKSPACE`).
+`--trust-repo-config` is allowed only in managed mode, where the control
+plane writes `.sealos/build-runtime.json`; never pass it for a contract that
+came from the repository itself. The script still enforces its endpoint,
+Secret, path, and image allowlists.
 Read [../k8s-kaniko-job/SKILL.md](../k8s-kaniko-job/SKILL.md) first.
 Use the returned digest-pinned `image_ref` in the template. If `pull` is
 `private`, create the `<app>-pull` secret now (command in that SKILL.md) and

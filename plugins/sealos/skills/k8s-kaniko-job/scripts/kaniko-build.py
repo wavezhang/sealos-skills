@@ -10,19 +10,28 @@ Standard library only. Requires: kubectl, tar, GITHUB_TOKEN (write:packages).
 
 Inputs, in precedence order:
   1. CLI flags
-  2. .sealos/build-runtime.json (written by the Brain control plane):
-     s3Endpoint (Job-reachable), bucket, accessKeyId, secretKeyRef
-     {name,key}, buildDeadlineAt, buildDeadlineSeconds, devboxName
+  2. .sealos/build-runtime.json (written by the Brain control plane), only
+     with --trust-repo-config: s3Endpoint (Job-reachable), bucket,
+     accessKeyId, secretKeyRef {name,key}, buildDeadlineAt,
+     buildDeadlineSeconds, devboxName
   3. DevBox runtime env: KANIKO_CONTEXT_POSIX_DIR, KANIKO_CONTEXT_S3_BUCKET,
      KANIKO_CONTEXT_S3_PREFIX, KANIKO_JOB_S3_ENDPOINT, S3_ENDPOINT,
      AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY / SEALOS_DEVBOX_JWT_SECRET /
      DEVBOX_JWT_SECRET, AWS_REGION, VERSITYGW_ROOT, SEALOS_DEVBOX_NAME
   4. Documented defaults (labring-actions/devbox-runtime sandbox/v1)
 
+The repository contract is ignored by default. Values that survive
+--trust-repo-config are still checked against allowlists: devboxName must be a
+DNS label, object paths must stay under the context store, s3Endpoint must be a
+cluster-internal/allowlisted host, secretKeyRef must name an allowlisted
+Secret, and --kaniko-image must be a digest-pinned image from a trusted
+registry.
+
 Usage:
   kaniko-build.py --image ghcr.io/<owner>/<repo>:<tag> [--context DIR]
                   [--dockerfile PATH] [--namespace NS] [--build-arg K=V ...]
-                  [--runtime-file PATH] [--render-only] [--timeout SECONDS]
+                  [--runtime-file PATH] [--trust-repo-config]
+                  [--render-only] [--timeout SECONDS]
 
 Output: one JSON object on stdout. Progress and diagnostics go to stderr.
 Success: {"success": true, "image": "<tag ref>", "digest": "sha256:...",
@@ -32,6 +41,7 @@ Success: {"success": true, "image": "<tag ref>", "digest": "sha256:...",
 import argparse
 import base64
 import calendar
+import ipaddress
 import json
 import os
 import re
@@ -54,9 +64,36 @@ DEFAULT_S3_PORT = "1319"
 TAR_EXCLUDES = [".git", ".sealos", ".versitygw-s3", ".versitygw-iam", ".versitygw-versioning"]
 DNS_LABEL_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 DIGEST_RE = re.compile(r"sha256:[a-f0-9]{64}")
+IMAGE_DIGEST_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
+S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 IMAGE_RE = re.compile(
     r"^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*:"
     r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+)
+
+# Repository content is untrusted. Only kaniko images from these registries
+# are accepted, and only when pinned by digest.
+TRUSTED_REGISTRIES_ENV = "KANIKO_TRUSTED_REGISTRIES"
+DEFAULT_TRUSTED_REGISTRIES = ("gcr.io/kaniko-project",)
+
+# S3 endpoints the build Job may talk to. Extra hosts must be configured
+# explicitly; repository-provided values are ignored unless allowlisted.
+S3_ALLOWED_HOSTS_ENV = "KANIKO_S3_ALLOWED_HOSTS"
+
+# Existing Secret names a repository-provided secretKeyRef may reference.
+# Entries are "name" or "name:key"; extra entries come from the environment.
+S3_SECRET_ALLOWLIST_ENV = "KANIKO_S3_SECRET_ALLOWLIST"
+DEFAULT_ALLOWED_SECRET_REFS = (("devbox-secret", None),)
+
+RUNTIME_CONTRACT_FIELDS = (
+    "accessKeyId",
+    "bucket",
+    "buildDeadlineAt",
+    "buildDeadlineSeconds",
+    "devboxName",
+    "region",
+    "s3Endpoint",
+    "secretKeyRef",
 )
 SAMPLE_MANIFEST = """apiVersion: batch/v1
 kind: Job
@@ -144,6 +181,197 @@ def load_runtime_contract(path):
         return {}
 
 
+def resolve_runtime_contract(runtime, trusted):
+    """Allow the repository contract only when the caller opts in explicitly.
+
+    The summary lists recognized field names only; values may contain
+    credentials and are never logged.
+    """
+    if not runtime:
+        return {}
+    fields = sorted(k for k in runtime if k in RUNTIME_CONTRACT_FIELDS)
+    log("runtime contract fields: " + (", ".join(fields) if fields else "none recognized"))
+    if trusted:
+        log("runtime contract accepted via --trust-repo-config; allowlists still apply")
+        return runtime
+    log(
+        "warning: repository-supplied build runtime contract ignored (default "
+        "deny); pass --trust-repo-config only for a control-plane-written contract"
+    )
+    return {}
+
+
+def require_dns_label(value, name, max_length=63):
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > max_length
+        or not DNS_LABEL_RE.fullmatch(value)
+    ):
+        fail(f"{name} must be a DNS label (a-z, 0-9, '-') up to {max_length} chars")
+    return value
+
+
+def resolve_devbox(runtime):
+    for value, source in (
+        (runtime.get("devboxName"), "runtime contract devboxName"),
+        (os.environ.get("SEALOS_DEVBOX_NAME"), "SEALOS_DEVBOX_NAME"),
+        (os.environ.get("DEVBOX_NAME"), "DEVBOX_NAME"),
+    ):
+        if value:
+            return require_dns_label(value, source)
+    hostname = sanitize_dns_label(os.environ.get("HOSTNAME") or "devbox", 63) or "devbox"
+    return require_dns_label(hostname, "HOSTNAME")
+
+
+def safe_object_dir(posix_dir, devbox, build_id):
+    devbox = require_dns_label(devbox, "devboxName")
+    build_id = require_dns_label(build_id, "build id")
+    root = os.path.realpath(posix_dir)
+    object_dir = os.path.realpath(os.path.join(root, devbox, build_id))
+    try:
+        inside = os.path.commonpath([root, object_dir]) == root
+    except ValueError:
+        inside = False
+    if not inside or object_dir == root:
+        fail("refusing to write the build context outside the context store")
+    return object_dir
+
+
+def validate_bucket(bucket):
+    if (
+        not isinstance(bucket, str)
+        or ".." in bucket
+        or not S3_BUCKET_RE.fullmatch(bucket)
+    ):
+        fail("S3 bucket name is invalid")
+    return bucket
+
+
+def validate_prefix(prefix):
+    if (
+        not isinstance(prefix, str)
+        or not prefix
+        or prefix.startswith("/")
+        or prefix.endswith("/")
+        or ".." in prefix.split("/")
+        or any(part == "" for part in prefix.split("/"))
+    ):
+        fail("S3 context prefix is invalid")
+    return prefix
+
+
+def configured_s3_hosts():
+    return tuple(
+        host.strip().lower().rstrip(".")
+        for host in os.environ.get(S3_ALLOWED_HOSTS_ENV, "").split(",")
+        if host.strip()
+    )
+
+
+def is_private_ip(host):
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_private or address.is_loopback or address.is_link_local
+
+
+def s3_host_allowed(host):
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host in configured_s3_hosts():
+        return True
+    if host in ("localhost", "localhost.localdomain"):
+        return True
+    if host.endswith(".svc") or host.endswith(".svc.cluster.local"):
+        return True
+    return is_private_ip(host)
+
+
+def validate_s3_endpoint(candidate, source, strict=False):
+    """Return a trusted endpoint, or None for an untrusted repository value."""
+    raw = (candidate or "").strip()
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    reason = None
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        reason = "not an http(s) URL"
+    elif parsed.username or parsed.password:
+        reason = "must not embed credentials"
+    else:
+        try:
+            parsed.port
+        except ValueError:
+            reason = "has an invalid port"
+    if reason is None and not s3_host_allowed(parsed.hostname):
+        reason = "host is outside the trusted S3 allowlist"
+    if reason:
+        if strict:
+            fail(f"{source} S3 endpoint rejected: {reason}", allowlist_env=S3_ALLOWED_HOSTS_ENV)
+        log(f"warning: ignoring {source} S3 endpoint: {reason}")
+        return None
+    return raw.rstrip("/")
+
+
+def trusted_registries():
+    extra = tuple(
+        item.strip().lower().rstrip("/")
+        for item in os.environ.get(TRUSTED_REGISTRIES_ENV, "").split(",")
+        if item.strip()
+    )
+    return DEFAULT_TRUSTED_REGISTRIES + extra
+
+
+def validate_kaniko_image(image):
+    repo, separator, digest = image.rpartition("@")
+    if not separator or not IMAGE_DIGEST_RE.fullmatch(digest):
+        fail("--kaniko-image must be pinned by digest (repo@sha256:<64 hex>)")
+    if (
+        not re.fullmatch(r"[a-z0-9][a-z0-9._:/-]*", repo)
+        or ".." in repo
+        or "//" in repo
+        or repo.endswith("/")
+    ):
+        fail("--kaniko-image repository reference is invalid")
+    trusted = any(
+        repo == prefix or repo.startswith(prefix + "/")
+        for prefix in trusted_registries()
+    )
+    if not trusted:
+        fail(
+            "--kaniko-image registry is not in the trusted allowlist",
+            allowlist_env=TRUSTED_REGISTRIES_ENV,
+        )
+    return image
+
+
+def allowed_secret_refs():
+    raw = os.environ.get(S3_SECRET_ALLOWLIST_ENV)
+    if raw is None:
+        return DEFAULT_ALLOWED_SECRET_REFS
+    refs = []
+    for item in raw.split(","):
+        entry = item.strip()
+        if not entry:
+            continue
+        name, _, key = entry.partition(":")
+        if name:
+            refs.append((name, key or None))
+    return tuple(refs)
+
+
+def secret_ref_allowed(ref):
+    name = ref.get("name")
+    key = ref.get("key")
+    return any(
+        allowed_name == name and (allowed_key is None or allowed_key == key)
+        for allowed_name, allowed_key in allowed_secret_refs()
+    )
+
+
 def resolve_namespace(args_namespace):
     for candidate, source in [
         (args_namespace, "flag"),
@@ -196,23 +424,35 @@ def is_loopback(url):
 
 
 def resolve_job_s3_endpoint(runtime, namespace):
-    """S3 endpoint the Kaniko Job Pod can reach (never loopback)."""
-    for candidate in (runtime.get("s3Endpoint"), os.environ.get("KANIKO_JOB_S3_ENDPOINT")):
-        if candidate and not is_loopback(candidate):
-            return candidate.rstrip("/")
-    local = (
+    """S3 endpoint the Kaniko Job Pod can reach (never loopback).
+
+    Repository-provided endpoints are ignored unless they match the allowlist;
+    explicitly configured environment endpoints are rejected when they do not.
+    """
+    for candidate, source, strict in (
+        (runtime.get("s3Endpoint"), "runtime contract", False),
+        (os.environ.get("KANIKO_JOB_S3_ENDPOINT"), "KANIKO_JOB_S3_ENDPOINT", True),
+    ):
+        endpoint = validate_s3_endpoint(candidate, source, strict=strict)
+        if endpoint and not is_loopback(endpoint):
+            return endpoint
+
+    local = validate_s3_endpoint(
         os.environ.get("S3_ENDPOINT")
         or os.environ.get("AWS_ENDPOINT_URL_S3")
         or os.environ.get("AWS_ENDPOINT_URL")
-        or f"http://127.0.0.1:{DEFAULT_S3_PORT}"
+        or f"http://127.0.0.1:{DEFAULT_S3_PORT}",
+        "local S3 endpoint",
+        strict=True,
     )
     if not is_loopback(local):
-        return local.rstrip("/")
+        return local
     pod_ip = resolve_pod_ip(namespace)
     if not pod_ip:
         fail(
             "cannot derive a Job-reachable S3 endpoint: runtime contract has no "
-            "s3Endpoint, KANIKO_JOB_S3_ENDPOINT is unset, and the Pod IP is unknown"
+            "trusted s3Endpoint, KANIKO_JOB_S3_ENDPOINT is unset, and the Pod IP "
+            "is unknown"
         )
     parsed = urllib.parse.urlparse(local)
     return f"{parsed.scheme}://{pod_ip}:{parsed.port or DEFAULT_S3_PORT}"
@@ -228,15 +468,21 @@ def resolve_context_store(runtime):
     """
     env_dir = os.environ.get("KANIKO_CONTEXT_POSIX_DIR")
     if env_dir:
-        bucket = os.environ.get("KANIKO_CONTEXT_S3_BUCKET", DEFAULT_BUCKET)
-        prefix = os.environ.get("KANIKO_CONTEXT_S3_PREFIX", DEFAULT_PREFIX)
+        bucket = validate_bucket(
+            os.environ.get("KANIKO_CONTEXT_S3_BUCKET", DEFAULT_BUCKET)
+        )
+        prefix = validate_prefix(
+            os.environ.get("KANIKO_CONTEXT_S3_PREFIX", DEFAULT_PREFIX)
+        )
         return env_dir, bucket, prefix
-    bucket = (
+    bucket = validate_bucket(
         os.environ.get("KANIKO_CONTEXT_S3_BUCKET")
         or runtime.get("bucket")
         or DEFAULT_BUCKET
     )
-    prefix = os.environ.get("KANIKO_CONTEXT_S3_PREFIX", DEFAULT_PREFIX)
+    prefix = validate_prefix(
+        os.environ.get("KANIKO_CONTEXT_S3_PREFIX", DEFAULT_PREFIX)
+    )
     root = os.environ.get("VERSITYGW_ROOT") or os.path.join(
         os.environ.get("CODEX_GATEWAY_CWD", "/home/devbox/workspace"), ".versitygw-s3"
     )
@@ -349,9 +595,11 @@ def prepare_context_tar(context_dir, dockerfile, posix_dir, prefix, devbox, buil
         fail("dockerfile not found")
     dockerfile_rel = os.path.relpath(dockerfile_abs, context_dir).replace(os.sep, "/")
 
-    object_dir = os.path.join(posix_dir, devbox, build_id)
+    object_dir = safe_object_dir(posix_dir, devbox, build_id)
     os.makedirs(object_dir, exist_ok=True)
     tar_path = os.path.join(object_dir, "context.tar.gz")
+    if os.path.realpath(tar_path) != os.path.join(object_dir, "context.tar.gz"):
+        fail("refusing to write the build context through a symlink")
     exclude_args = []
     for name in TAR_EXCLUDES:
         exclude_args += ["--exclude", f"./{name}"]
@@ -391,14 +639,20 @@ def s3_credential_env(runtime, namespace):
     access_key = runtime.get("accessKeyId") or os.environ.get("AWS_ACCESS_KEY_ID", "admin")
     ref = runtime.get("secretKeyRef")
     if isinstance(ref, dict) and ref.get("name") and ref.get("key"):
-        code, _, _ = kubectl(["get", "secret", ref["name"], "-n", namespace])
-        if code == 0:
-            lines = [
-                yaml_env_literal("AWS_ACCESS_KEY_ID", access_key),
-                yaml_env_secret("AWS_SECRET_ACCESS_KEY", ref["name"], ref["key"]),
-            ]
-            return lines, None
-        log("warning: runtime S3 secret reference is unavailable; falling back to env")
+        if secret_ref_allowed(ref):
+            code, _, _ = kubectl(["get", "secret", ref["name"], "-n", namespace])
+            if code == 0:
+                lines = [
+                    yaml_env_literal("AWS_ACCESS_KEY_ID", access_key),
+                    yaml_env_secret("AWS_SECRET_ACCESS_KEY", ref["name"], ref["key"]),
+                ]
+                return lines, None
+            log("warning: runtime S3 secret reference is unavailable; falling back to env")
+        else:
+            log(
+                "warning: runtime S3 secret reference is not in the allowlist; "
+                "ignoring it and falling back to env"
+            )
     secret_value = (
         os.environ.get("AWS_SECRET_ACCESS_KEY")
         or os.environ.get("SEALOS_DEVBOX_JWT_SECRET")
@@ -562,7 +816,18 @@ def main():
                         help="kaniko --build-arg; values appear in the Job spec, never pass secrets")
     parser.add_argument("--runtime-file", help="path to .sealos/build-runtime.json")
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
-    parser.add_argument("--kaniko-image", default=DEFAULT_KANIKO_IMAGE)
+    parser.add_argument(
+        "--kaniko-image",
+        help=(
+            "kaniko executor image; must be pinned by digest and come from a "
+            f"trusted registry (default: {DEFAULT_KANIKO_IMAGE})"
+        ),
+    )
+    parser.add_argument(
+        "--trust-repo-config",
+        action="store_true",
+        help="use .sealos/build-runtime.json from the repository (default: ignore)",
+    )
     parser.add_argument("--timeout", type=int, help=f"build seconds cap (max {MAX_BUILD_SECONDS})")
     parser.add_argument("--render-only", action="store_true",
                         help="print a redacted sample Job manifest; no kubectl or tar upload")
@@ -571,19 +836,23 @@ def main():
     image_repo, _ = validate_image(args.image)
     for pair in args.build_arg:
         validate_build_arg(pair)
+    if args.kaniko_image:
+        kaniko_image = validate_kaniko_image(args.kaniko_image)
+    else:
+        kaniko_image = DEFAULT_KANIKO_IMAGE
+        log(
+            "warning: using the built-in kaniko executor tag; pass "
+            "--kaniko-image repo@sha256:<digest> to pin the executor"
+        )
 
     workspace = os.environ.get("SEALAI_DEPLOY_WORKSPACE") or os.getcwd()
     runtime_path = args.runtime_file or os.path.join(workspace, ".sealos", "build-runtime.json")
-    runtime = load_runtime_contract(runtime_path)
+    runtime = resolve_runtime_contract(
+        load_runtime_contract(runtime_path), args.trust_repo_config
+    )
     deadline_seconds = resolve_deadline_seconds(runtime, args.timeout)
     aws_region = runtime.get("region") or os.environ.get("AWS_REGION", "sealos-internal")
-    devbox = (
-        runtime.get("devboxName")
-        or os.environ.get("SEALOS_DEVBOX_NAME")
-        or os.environ.get("DEVBOX_NAME")
-        or os.environ.get("HOSTNAME")
-        or "devbox"
-    )
+    devbox = resolve_devbox(runtime)
     build_id = f"{sanitize_dns_label(image_repo.rsplit('/', 1)[-1], 30)}-{uuid.uuid4().hex[:8]}"
     job_name = f"kaniko-{build_id}"[:63].rstrip("-")
 
@@ -622,7 +891,7 @@ def main():
         job_name=job_name,
         namespace=namespace,
         service_account=service_account,
-        kaniko_image=args.kaniko_image,
+        kaniko_image=kaniko_image,
         platform=args.platform,
         context_uri=context_uri,
         dockerfile=dockerfile_rel,
